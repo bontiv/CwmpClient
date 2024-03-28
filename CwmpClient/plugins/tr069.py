@@ -7,6 +7,8 @@ log = logging.getLogger("TR-069")
 
 SOAPNS = 'http://schemas.xmlsoap.org/soap/envelope/'
 CWMPNS = 'urn:dslforum-org:cwmp-1-0'
+XSDNS = 'http://www.w3.org/2001/XMLSchema'
+XSINS = 'http://www.w3.org/2001/XMLSchema-instance'
 
 class Tr69Request:
     def __init__(self, config) -> None:
@@ -121,13 +123,13 @@ async def loader(rootnode):
     config.addItem('Device.ManagementServer.Username', str)
     config.addItem('Device.ManagementServer.PeriodicInformEnable', False)
     config.addItem('Device.ManagementServer.PeriodicInformInterval', 300)
-    config.addItem('Device.DeviceInfo.Manufacturer', "Dites Telecom")
-    config.addItem('Device.DeviceInfo.ManufacturerOUI', "FFFFFF")
-    config.addItem('Device.DeviceInfo.ProductClass', "DTBox1")
-    config.addItem('Device.DeviceInfo.SerialNumber', "0123456")
+    config.addItem('Device.DeviceInfo.Manufacturer', "Dites Telecom", writable=False)
+    config.addItem('Device.DeviceInfo.ManufacturerOUI', "FFFFFF", writable=False)
+    config.addItem('Device.DeviceInfo.ProductClass', "DTBox1", writable=False)
+    config.addItem('Device.DeviceInfo.SerialNumber', "0123456", writable=False)
     config.addItem('Device.DeviceInfo.ProvisioningCode', "")
-    config.addItem('Device.DeviceInfo.SoftwareVersion', "0.0.1")
-    config.addItem('Device.DeviceInfo.HardwareVersion', "1.0.0")
+    config.addItem('Device.DeviceInfo.SoftwareVersion', "0.0.1", writable=False)
+    config.addItem('Device.DeviceInfo.HardwareVersion', "1.0.0", writable=False)
     config.addItem('Device.DeviceInfo.ParameterKey', "")
     config.addItem('Device.RootDataModelVersion', "2.15", writable=False)
     config.write()
@@ -146,6 +148,8 @@ class SessionRequest:
         ans = Tr69Request(app)
         parts = ans.todom()
         answer = parts.document.createElementNS(CWMPNS, "cwmp:%sResponse" % self.method)
+        ans.document.documentElement.setAttributeNS(xmldom.XMLNS_NAMESPACE, 'xmlns:xsd', XSDNS)
+        ans.document.documentElement.setAttributeNS(xmldom.XMLNS_NAMESPACE, 'xmlns:xsi', XSINS)
         
         RequestId = parts.document.createElementNS(CWMPNS, 'cwmp:ID')
         RequestId.appendChild(parts.document.createTextNode(self.RequestId))
@@ -169,7 +173,7 @@ class ParameterList:
         if isinstance(currentNode, Parameter):
             self.parameters.update({prefix: currentNode})
         elif len(path) == 0:
-            self.parameters.update({prefix + '.' + name: child for name, child in currentNode.childs.items()})
+            self.parameters.update({(prefix + '.' if len(prefix) > 0 else '') + name: child for name, child in currentNode.childs.items()})
         else:
             node_name = path.pop(0)
             if len(node_name) == 0:
@@ -195,20 +199,38 @@ class ParameterListValue(ParameterList):
             name = document.createElement('Name')
             name.appendChild(document.createTextNode( key.lstrip(".") ))
             pis.appendChild(name)
-            writable = document.createElement('Value')
-            writable.appendChild(document.createTextNode(str(value)))
-            pis.appendChild(writable)
+            value_node = document.createElement('Value')
+            if value.type == bool:
+                value_node.appendChild(document.createTextNode("1" if value() else "0"))
+                value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:boolean')
+            elif value() is None:
+                value_node.appendChild(document.createTextNode("null"))
+            else:
+                value_node.appendChild(document.createTextNode(str(value())))
+                if value.type == int:
+                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:int')
+                elif value.type == float:
+                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:decimal')
+                elif value.type == str:
+                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:string')
+                elif type(value.type) == str:
+                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:' + value.type)
+                else:
+                    log.error("Unknown type conversion from %s to XML", value.type)
+                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:string')
+
+            pis.appendChild(value_node)
             pl.appendChild(pis)
         return pl
     
-class ParameterLisName(ParameterList):
+class ParameterListName(ParameterList):
     def todom(self, document):
         pl = document.createElement('ParameterList')
         pl.setAttributeNS(SOAPNS, 'soap:arrayType', "cwmp:ParameterInfoStruct[%d]" % len(self.parameters))
         for key, value in self.parameters.items():
             pis = document.createElement('ParameterInfoStruct')
             name = document.createElement('Name')
-            name.appendChild(document.createTextNode( key.lstrip(".") ))
+            name.appendChild(document.createTextNode( key if isinstance(value, Parameter) else key + "." ))
             pis.appendChild(name)
             writable = document.createElement('Writable')
             writable.appendChild(document.createTextNode("1" if value.writable else "0"))
@@ -233,7 +255,7 @@ class RequestGetParameterNames(SessionRequest):
         self.parameterPath = ParameterPathNode[0].firstChild.data if ParameterPathNode[0].hasChildNodes() else ""
 
         log.debug("Parsed Path: %s, Next level %s", self.parameterPath, self.nextLevel)
-        self.parameters = ParameterLisName(config)
+        self.parameters = ParameterListName(config)
         self.parameters.addPath(self.parameterPath)
 
     async def exec(self, app):

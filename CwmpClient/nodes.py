@@ -39,7 +39,15 @@ class Parameter:
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         if len(args) == 1:
-            self.set(args[0])
+            new_value = args[0]
+            # Common type cast
+            if self.type == int:
+                new_value = int(new_value)
+            elif self.type == bool:
+                new_value = new_value == "1"
+            elif self.type == float:
+                new_value = float(new_value)
+            self.set(new_value)
         else:
             return self.get()
 
@@ -62,9 +70,10 @@ class ConfigFileParameter:
 
         path_parts = path.split(".")
         node = self.root
+        value_type = value if type(value) == type else type(value)
 
         def setter(value):
-            self.config.set(path, parameter, value)
+            self.config.set(path, parameter, str(value))
             self.write()
 
         while len(path_parts) > 0:
@@ -75,7 +84,6 @@ class ConfigFileParameter:
             self.config.add_section(path)
 
         if parameter in self.config[path]:
-            value_type = value if type(value) == type else type(value)
             value = None
             if value_type == int:
                 value = self.config.getint(path, parameter)
