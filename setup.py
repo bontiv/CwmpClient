@@ -9,4 +9,5 @@ setup(
     maintainer="Remi BONNET",
     maintainer_email="bonnet@dites.team",
     include=['CwmpClient'],
+    description='Comming soon'
 )
