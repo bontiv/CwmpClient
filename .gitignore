@@ -2,3 +2,6 @@
 /venv
 /dist
 __pycache__
+
+# Settings when run locally
+tr069.ini

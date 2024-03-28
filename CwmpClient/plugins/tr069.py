@@ -2,6 +2,7 @@ from CwmpClient.nodes import *
 import aiohttp
 import logging
 import xml.dom as xmldom
+from asyncio import sleep
 log = logging.getLogger("TR-069")
 
 SOAPNS = 'http://schemas.xmlsoap.org/soap/envelope/'
@@ -111,23 +112,25 @@ class Tr69Inform(Tr69Request):
 
 async def loader(rootnode):
     log.debug('Load defaults parameters')
-    rootnode['Device']['ManagementServer']['ConnectionRequestURL'] = ROParameter(str)
-    rootnode['Device']['ManagementServer']['ConnectionRequestPassword'] = Parameter(str)
-    rootnode['Device']['ManagementServer']['ConnectionRequestUsername'] = Parameter(str)
-    rootnode['Device']['ManagementServer']['URL'] = Parameter(str, "http://acs.dites.team/")
-    rootnode['Device']['ManagementServer']['Password'] = Parameter(str)
-    rootnode['Device']['ManagementServer']['Username'] = Parameter(str)
-    rootnode['Device']['ManagementServer']['PeriodicInformEnable'] = Parameter(bool, False)
-    rootnode['Device']['ManagementServer']['PeriodicInformInterval'] = Parameter(int, 300)
-    rootnode['Device']['DeviceInfo']['Manufacturer'] = Parameter(str, "Dites Telecom")
-    rootnode['Device']['DeviceInfo']['ManufacturerOUI'] = Parameter(str, "FFFFFF")
-    rootnode['Device']['DeviceInfo']['ProductClass'] = Parameter(str, "DTBox1")
-    rootnode['Device']['DeviceInfo']['SerialNumber'] = Parameter(str, "0123456")
-    rootnode['Device']['DeviceInfo']['ProvisioningCode'] = Parameter(str, "")
-    rootnode['Device']['DeviceInfo']['SoftwareVersion'] = Parameter(str, "0.0.1")
-    rootnode['Device']['DeviceInfo']['HardwareVersion'] = Parameter(str, "1.0.0")
-    rootnode['Device']['ManagementServer']['ParameterKey'] = Parameter(str, "")
-    rootnode['Device']['RootDataModelVersion'] = Parameter(str, "2.15")
+    config = ConfigFileParameter(rootnode, "tr069.ini")
+    config.addItem('Device.ManagementServer.ConnectionRequestURL', str, writable=False)
+    config.addItem('Device.ManagementServer.ConnectionRequestPassword', str)
+    config.addItem('Device.ManagementServer.ConnectionRequestUsername', str)
+    config.addItem('Device.ManagementServer.URL', "http://acs.dites.team/")
+    config.addItem('Device.ManagementServer.Password', str)
+    config.addItem('Device.ManagementServer.Username', str)
+    config.addItem('Device.ManagementServer.PeriodicInformEnable', False)
+    config.addItem('Device.ManagementServer.PeriodicInformInterval', 300)
+    config.addItem('Device.DeviceInfo.Manufacturer', "Dites Telecom")
+    config.addItem('Device.DeviceInfo.ManufacturerOUI', "FFFFFF")
+    config.addItem('Device.DeviceInfo.ProductClass', "DTBox1")
+    config.addItem('Device.DeviceInfo.SerialNumber', "0123456")
+    config.addItem('Device.DeviceInfo.ProvisioningCode', "")
+    config.addItem('Device.DeviceInfo.SoftwareVersion', "0.0.1")
+    config.addItem('Device.DeviceInfo.HardwareVersion', "1.0.0")
+    config.addItem('Device.DeviceInfo.ParameterKey', "")
+    config.addItem('Device.RootDataModelVersion', "2.15", writable=False)
+    config.write()
 
 class SessionRequest:
     def __init__(self, session, config, node) -> None:
@@ -217,7 +220,7 @@ class RequestGetParameterNames(SessionRequest):
     def __init__(self, session, config, node) -> None:
         super().__init__(session, config, node)
         self.method = 'GetParameterNames'
-        log.debug("Get Request GetParameterNames (%s)", node.toxml())
+        log.info("Get Request GetParameterNames (%s)", node.toxml())
         NextLevelNode = node.getElementsByTagName('NextLevel')
         if len(NextLevelNode) != 1:
             raise Exception("NextLevel node in GetParameterNames must be set")
@@ -236,6 +239,7 @@ class RequestGetParameterNames(SessionRequest):
     async def exec(self, app):
         dom, ans = self.getAnswer(app)
         ans.appendChild(self.parameters.todom(dom.document))
+        log.info("Send GetParameterNames (%s)", ans.toxml())
         acs_url = str(app.root['Device']['ManagementServer']['URL'])
         log.debug("Full response GetParamtersNames : %s", dom.document.toxml())
         async with self.session.post(acs_url, data=dom.document.toxml(), headers={'SOAPAction': ''}) as data:
@@ -245,7 +249,7 @@ class RequestGetParameterValues(SessionRequest):
     def __init__(self, session, config, node) -> None:
         super().__init__(session, config, node)
         self.method = 'GetParameterValues'
-        log.debug("Get Request GetParameterValues (%s)", node.toxml())
+        log.info("Get Request GetParameterValues (%s)", node.toxml())
 
         ParameterNode = node.getElementsByTagName('ParameterNames')[0]
         self.parameters = ParameterListValue(config)
@@ -259,6 +263,7 @@ class RequestGetParameterValues(SessionRequest):
     async def exec(self, app):
         dom, ans = self.getAnswer(app)
         ans.appendChild(self.parameters.todom(dom.document))
+        log.info("Send GetParameterValues (%s)", ans.toxml())
         acs_url = str(app.root['Device']['ManagementServer']['URL'])
         log.debug("Full response GetParameterValues : %s", dom.document.toxml())
         async with self.session.post(acs_url, data=dom.document.toxml(), headers={'SOAPAction': ''}) as data:
@@ -267,6 +272,7 @@ class RequestGetParameterValues(SessionRequest):
 class RequestReboot(SessionRequest):
     def __init__(self, session, node) -> None:
         super().__init__(session)
+        log.info("Get Reboot command")
 
     async def exec(self, app):
         """
@@ -281,6 +287,7 @@ class RequestSetParameterValues(SessionRequest):
     def __init__(self, session, config, node) -> None:
         super().__init__(session, config, node)
         self.method = "SetParameterValues"
+        log.info("Get Request SetParameterValues (%s)", node.toxml())
         self.parameters = ParameterListValue(config)
         ParametersValues = node.getElementsByTagName('ParameterValueStruct')
 
@@ -301,6 +308,7 @@ class RequestSetParameterValues(SessionRequest):
     async def exec(self, app):
         dom, ans = self.getAnswer(app)
         ans.appendChild(self.parameters.todom(dom.document))
+        log.info("Send SetParameterValues (%s)", ans.toxml())
         acs_url = str(app.root['Device']['ManagementServer']['URL'])
         log.debug("Full response SetParameterValues : %s", dom.document.toxml())
         async with self.session.post(acs_url, data=dom.document.toxml(), headers={'SOAPAction': ''}) as data:
@@ -337,29 +345,38 @@ async def get_next_request(app, session, status, textdata):
                 RequestMethod.RequestId = RequestId[0].firstChild.data
             yield RequestMethod
 
+async def _start_session(app, req : Tr69Inform) -> None:
+    acs_url = str(app.root['Device']['ManagementServer']['URL'])
+    log.info("Start inform session events: %s", ", ".join(req.events))
+    log.debug("Send new session Inform %s", req.toxml())
+    async with aiohttp.ClientSession() as session:
+        async with session.post(acs_url, data=req.toxml()) as boot:
+            log.debug("Get Inform answer from ACS Status %s, Headers %s, Data: %s", boot.status, boot.headers, await boot.text())
+            try:
+                async with session.post(acs_url, data="") as data:
+                    text = await data.text()
+                    status = data.status
+
+                while True:
+                    async for method in get_next_request(app, session, status, text):
+                        status, text = await method.exec(app)
+                
+            except CloseSession:
+                log.info("End session")
+
+
 async def start(app):
     """
     Start TR69 Client. Send Boot event and start interval
     """
-    acs_url = str(app.root['Device']['ManagementServer']['URL'])
-    log.debug("Start session boot %s" % acs_url)
-    
-    async with aiohttp.ClientSession() as session:
-        req = Tr69Inform(app.root, ['1 BOOT', 'M Reboot'])
-        log.debug("Send new session Inform %s", req.toxml())
+    import sys
+    events = ['1 BOOT']
+    if len(sys.argv) > 1:
+        events.append(sys.argv[1])
+    req = Tr69Inform(app.root, events)
+    await _start_session(app, req)
+    while app.root['Device']['ManagementServer']['PeriodicInformEnable']():
+        await sleep(app.root['Device']['ManagementServer']['PeriodicInformInterval']())
+        await _start_session(app, Tr69Inform(app.root, ['2 PERIODIC']))
 
-        async with session.post(acs_url, data=req.toxml()) as boot:
-            log.debug("Get Inform answer from ACS Status %s, Headers %s, Data: %s", boot.status, boot.headers, await boot.text())
-        try:
-            async with session.post(acs_url, data="") as data:
-                text = await data.text()
-                status = data.status
-
-            while True:
-                async for method in get_next_request(app, session, status, text):
-                    status, text = await method.exec(app)
-            
-        except CloseSession:
-            pass
-
-        print("End session")
+    print("End session")

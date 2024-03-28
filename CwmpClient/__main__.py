@@ -8,7 +8,7 @@ from CwmpClient.nodes import BaseNode
 import CwmpClient.plugins
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 def iter_namespace(ns_pkg):
     # Specifying the second argument (prefix) to iter_modules makes the
