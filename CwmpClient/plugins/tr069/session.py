@@ -1,14 +1,10 @@
-from CwmpClient.nodes import *
-import aiohttp
-import logging
+import logging, aiohttp, asyncio
 import xml.dom as xmldom
-from asyncio import sleep
-log = logging.getLogger("TR-069")
+from CwmpClient.app import App
+from CwmpClient.nodes import *
+from xml.dom.minidom import parseString
 
-SOAPNS = 'http://schemas.xmlsoap.org/soap/envelope/'
-CWMPNS = 'urn:dslforum-org:cwmp-1-0'
-XSDNS = 'http://www.w3.org/2001/XMLSchema'
-XSINS = 'http://www.w3.org/2001/XMLSchema-instance'
+log = logging.getLogger("TR-069:Session")
 
 class Tr69Request:
     def __init__(self, config) -> None:
@@ -69,15 +65,62 @@ class Tr69Request:
         return self.todom().document.toxml()
 
 class Tr69Inform(Tr69Request):
-    def __init__(self, config, events) -> None:
-        super().__init__(config)
+    """ Lock, run only one request at once """
+    lock = asyncio.Lock()
+
+    def __init__(self, app, *events) -> None:
+        super().__init__(app.root)
         self.events = events
         self.retry = 0
-        self.parameters = ParameterListValue(config)
+        self.app = app
+        self.parameters = ParameterListValue(app.root)
         self.parameters.addPath('Device.RootDataModelVersion')
         self.parameters.addPath('Device.DeviceInfo.')
         self.parameters.addPath('Device.ManagementServer.ParameterKey')
+        self.parameters.addPath('Device.ManagementServer.ConnectionRequestURL')
+        self.parameters.addPath('Device.ManagementServer.NATDetected')
+        self.parameters.addPath('Device.ManagementServer.STUNEnable')
+        self.parameters.addPath('Device.ManagementServer.UDPConnectionRequestAddress')
 
+    async def _get_next_request(self, session, status, textdata):
+        log.debug("Get request from ACS Status %s, Data: %s", status, textdata)
+        if status != 200:
+            raise CloseSession()
+
+        answer = parseString(textdata)
+        body = answer.getElementsByTagNameNS(SOAPNS, 'Body')[0]
+        RequestId = answer.getElementsByTagNameNS(CWMPNS, 'ID')
+        for req in body.childNodes:
+            node_name = req.tagName.split(':')[1] if req.tagName.find(':') != -1 else req.tagName
+            if node_name not in supported_methods:
+                log.error("Receive unsupported method: %s" % node_name)
+                raise Exception("Receive unsupported method: %s" % node_name)
+            else:
+                RequestMethod = supported_methods[node_name](session, self.config, req)
+                if len(RequestId) > 0:
+                    RequestMethod.RequestId = RequestId[0].firstChild.data
+                yield RequestMethod
+
+    async def run(self) -> None:
+        acs_url = str(self.config['Device']['ManagementServer']['URL'])
+        async with self.lock:
+            log.info("Start inform session events: %s", ", ".join(self.events))
+            log.debug("Send new session Inform %s", self.toxml())
+            async with aiohttp.ClientSession() as session:
+                async with session.post(acs_url, data=self.toxml()) as boot:
+                    log.debug("Get Inform answer from ACS Status %s, Headers %s, Data: %s", boot.status, boot.headers, await boot.text())
+                    try:
+                        async with session.post(acs_url, data="") as data:
+                            text = await data.text()
+                            status = data.status
+
+                        while True:
+                            async for method in self._get_next_request(session, status, text):
+                                status, text = await method.exec(self.app)
+                        
+                    except CloseSession:
+                        log.info("End session")
+                    
     def todom(self):
         from datetime import datetime
         doc = super().todom()
@@ -112,39 +155,17 @@ class Tr69Inform(Tr69Request):
         doc.body.appendChild(inform)
         return doc
 
-async def loader(rootnode):
-    log.debug('Load defaults parameters')
-    config = ConfigFileParameter(rootnode, "tr069.ini")
-    config.addItem('Device.ManagementServer.ConnectionRequestURL', str, writable=False)
-    config.addItem('Device.ManagementServer.ConnectionRequestPassword', str)
-    config.addItem('Device.ManagementServer.ConnectionRequestUsername', str)
-    config.addItem('Device.ManagementServer.URL', "http://acs.dites.team/")
-    config.addItem('Device.ManagementServer.Password', str)
-    config.addItem('Device.ManagementServer.Username', str)
-    config.addItem('Device.ManagementServer.PeriodicInformEnable', False)
-    config.addItem('Device.ManagementServer.PeriodicInformInterval', 300)
-    config.addItem('Device.DeviceInfo.Manufacturer', "Dites Telecom", writable=False)
-    config.addItem('Device.DeviceInfo.ManufacturerOUI', "FFFFFF", writable=False)
-    config.addItem('Device.DeviceInfo.ProductClass', "DTBox1", writable=False)
-    config.addItem('Device.DeviceInfo.SerialNumber', "0123456", writable=False)
-    config.addItem('Device.DeviceInfo.ProvisioningCode', "")
-    config.addItem('Device.DeviceInfo.SoftwareVersion', "0.0.1", writable=False)
-    config.addItem('Device.DeviceInfo.HardwareVersion', "1.0.0", writable=False)
-    config.addItem('Device.DeviceInfo.ParameterKey', "")
-    config.addItem('Device.RootDataModelVersion', "2.15", writable=False)
-    config.write()
-
 class SessionRequest:
-    def __init__(self, session, config, node) -> None:
+    def __init__(self, session, config: BaseNode, node: xmldom.Node) -> None:
         self.session = session
         self.method = None
         self.config = config
         self.RequestId = None
 
-    async def exec(self, app):
+    async def exec(self, app: App) -> None:
         raise NotImplementedError()
     
-    def getAnswer(self, app):
+    def getAnswer(self, app: App):
         ans = Tr69Request(app)
         parts = ans.todom()
         answer = parts.document.createElementNS(CWMPNS, "cwmp:%sResponse" % self.method)
@@ -159,87 +180,8 @@ class SessionRequest:
         parts.body.appendChild(answer)
         return parts, answer
 
-class ParameterList:
-    def __init__(self, config) -> None:
-        self.config = config
-        self.parameters = dict()
-
-    def addPath(self, path: str) -> None:
-        path_parts = path.split('.') if len(path) > 0 else []
-        self._get_parameters(self.config, path_parts)
-
-    def _get_parameters(self, currentNode : BaseNode, path: list[str], prefix: str = "") -> None:
-        log.debug("Prefix: %s, Path: %s", prefix, path)
-        if isinstance(currentNode, Parameter):
-            self.parameters.update({prefix: currentNode})
-        elif len(path) == 0:
-            self.parameters.update({(prefix + '.' if len(prefix) > 0 else '') + name: child for name, child in currentNode.childs.items()})
-        else:
-            node_name = path.pop(0)
-            if len(node_name) == 0:
-                self.parameters.update({prefix + '.' + name: child for name, child in currentNode.childs.items()})
-            elif node_name == '*':
-                for node_name in currentNode.childs:
-                    self._get_parameters(currentNode[node_name], path, prefix + '.' + node_name if len(prefix) > 0 else node_name)
-            else:
-                self._get_parameters(currentNode[node_name], path, prefix + '.' + node_name if len(prefix) > 0 else node_name)
-
-    def todom(self, document):
-        raise NotImplementedError()
-
-    def __repr__(self) -> str:
-        return "ParameterList[ %s ]" % ", ".join(" = ".join([key, str(value)]) for key, value in self.parameters.items())
-
-class ParameterListValue(ParameterList):
-    def todom(self, document):
-        pl = document.createElement('ParameterList')
-        pl.setAttributeNS(SOAPNS, 'soap:arrayType', "cwmp:ParameterValueStruct[%d]" % len(self.parameters))
-        for key, value in self.parameters.items():
-            pis = document.createElement('ParameterValueStruct')
-            name = document.createElement('Name')
-            name.appendChild(document.createTextNode( key.lstrip(".") ))
-            pis.appendChild(name)
-            value_node = document.createElement('Value')
-            if value.type == bool:
-                value_node.appendChild(document.createTextNode("1" if value() else "0"))
-                value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:boolean')
-            elif value() is None:
-                value_node.appendChild(document.createTextNode("null"))
-            else:
-                value_node.appendChild(document.createTextNode(str(value())))
-                if value.type == int:
-                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:int')
-                elif value.type == float:
-                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:decimal')
-                elif value.type == str:
-                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:string')
-                elif type(value.type) == str:
-                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:' + value.type)
-                else:
-                    log.error("Unknown type conversion from %s to XML", value.type)
-                    value_node.setAttributeNS(XSINS, 'xsi:type', 'xsd:string')
-
-            pis.appendChild(value_node)
-            pl.appendChild(pis)
-        return pl
-    
-class ParameterListName(ParameterList):
-    def todom(self, document):
-        pl = document.createElement('ParameterList')
-        pl.setAttributeNS(SOAPNS, 'soap:arrayType', "cwmp:ParameterInfoStruct[%d]" % len(self.parameters))
-        for key, value in self.parameters.items():
-            pis = document.createElement('ParameterInfoStruct')
-            name = document.createElement('Name')
-            name.appendChild(document.createTextNode( key if isinstance(value, Parameter) else key + "." ))
-            pis.appendChild(name)
-            writable = document.createElement('Writable')
-            writable.appendChild(document.createTextNode("1" if value.writable else "0"))
-            pis.appendChild(writable)
-            pl.appendChild(pis)
-        return pl
-
 class RequestGetParameterNames(SessionRequest):
-    def __init__(self, session, config, node) -> None:
+    def __init__(self, session, config: BaseNode, node: xmldom.Node) -> None:
         super().__init__(session, config, node)
         self.method = 'GetParameterNames'
         log.info("Get Request GetParameterNames (%s)", node.toxml())
@@ -258,7 +200,7 @@ class RequestGetParameterNames(SessionRequest):
         self.parameters = ParameterListName(config)
         self.parameters.addPath(self.parameterPath)
 
-    async def exec(self, app):
+    async def exec(self, app: App) -> None:
         dom, ans = self.getAnswer(app)
         ans.appendChild(self.parameters.todom(dom.document))
         log.info("Send GetParameterNames (%s)", ans.toxml())
@@ -292,11 +234,11 @@ class RequestGetParameterValues(SessionRequest):
             return data.status, await data.text()
 
 class RequestReboot(SessionRequest):
-    def __init__(self, session, node) -> None:
+    def __init__(self, session, node: xmldom.Node) -> None:
         super().__init__(session)
         log.info("Get Reboot command")
 
-    async def exec(self, app):
+    async def exec(self, app: App) -> None:
         """
         Simulation of Reboot with Inform
         """
@@ -306,7 +248,7 @@ class RequestReboot(SessionRequest):
             log.debug("Send Reboot simulation. Status %d, Headers: %s, Data: %s", data.status, data.headers, await data.text())
 
 class RequestSetParameterValues(SessionRequest):
-    def __init__(self, session, config, node) -> None:
+    def __init__(self, session, config: BaseNode, node: xmldom.Node) -> None:
         super().__init__(session, config, node)
         self.method = "SetParameterValues"
         log.info("Get Request SetParameterValues (%s)", node.toxml())
@@ -327,7 +269,7 @@ class RequestSetParameterValues(SessionRequest):
             self.parameters.addPath(name)
             self.parameters.parameters[name](value.firstChild.data)
 
-    async def exec(self, app):
+    async def exec(self, app: App) -> None:
         dom, ans = self.getAnswer(app)
         ans.appendChild(self.parameters.todom(dom.document))
         log.info("Send SetParameterValues (%s)", ans.toxml())
@@ -336,69 +278,14 @@ class RequestSetParameterValues(SessionRequest):
         async with self.session.post(acs_url, data=dom.document.toxml(), headers={'SOAPAction': ''}) as data:
             return data.status, await data.text()
 
+class CloseSession(Exception):
+    def __init__(self, *args: object) -> None:
+        super().__init__("Session closed by ACS", *args)
+
+
 supported_methods = {
     'GetParameterNames': RequestGetParameterNames,
     'Reboot': RequestReboot,
     'GetParameterValues': RequestGetParameterValues,
     'SetParameterValues': RequestSetParameterValues,
 }
-
-class CloseSession(Exception):
-    def __init__(self, *args: object) -> None:
-        super().__init__("Session closed by ACS", *args)
-
-async def get_next_request(app, session, status, textdata):
-    from xml.dom.minidom import parseString
-    log.debug("Get request from ACS Status %s, Data: %s", status, textdata)
-    if status != 200:
-        raise CloseSession()
-
-    answer = parseString(textdata)
-    body = answer.getElementsByTagNameNS(SOAPNS, 'Body')[0]
-    RequestId = answer.getElementsByTagNameNS(CWMPNS, 'ID')
-    for req in body.childNodes:
-        node_name = req.tagName.split(':')[1] if req.tagName.find(':') != -1 else req.tagName
-        if node_name not in supported_methods:
-            log.error("Receive unsupported method: %s" % node_name)
-            raise Exception("Receive unsupported method: %s" % node_name)
-        else:
-            RequestMethod = supported_methods[node_name](session, app.root, req)
-            if len(RequestId) > 0:
-                RequestMethod.RequestId = RequestId[0].firstChild.data
-            yield RequestMethod
-
-async def _start_session(app, req : Tr69Inform) -> None:
-    acs_url = str(app.root['Device']['ManagementServer']['URL'])
-    log.info("Start inform session events: %s", ", ".join(req.events))
-    log.debug("Send new session Inform %s", req.toxml())
-    async with aiohttp.ClientSession() as session:
-        async with session.post(acs_url, data=req.toxml()) as boot:
-            log.debug("Get Inform answer from ACS Status %s, Headers %s, Data: %s", boot.status, boot.headers, await boot.text())
-            try:
-                async with session.post(acs_url, data="") as data:
-                    text = await data.text()
-                    status = data.status
-
-                while True:
-                    async for method in get_next_request(app, session, status, text):
-                        status, text = await method.exec(app)
-                
-            except CloseSession:
-                log.info("End session")
-
-
-async def start(app):
-    """
-    Start TR69 Client. Send Boot event and start interval
-    """
-    import sys
-    events = ['1 BOOT']
-    if len(sys.argv) > 1:
-        events.append(sys.argv[1])
-    req = Tr69Inform(app.root, events)
-    await _start_session(app, req)
-    while app.root['Device']['ManagementServer']['PeriodicInformEnable']():
-        await sleep(app.root['Device']['ManagementServer']['PeriodicInformInterval']())
-        await _start_session(app, Tr69Inform(app.root, ['2 PERIODIC']))
-
-    print("End session")
