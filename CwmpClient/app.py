@@ -7,6 +7,7 @@ from CwmpClient.helpers import prettyprint
 from CwmpClient.nodes import BaseNode
 import CwmpClient.plugins
 
+
 def iter_namespace(ns_pkg):
     # Specifying the second argument (prefix) to iter_modules makes the
     # returned name an absolute name instead of a relative one. This allows
@@ -14,22 +15,26 @@ def iter_namespace(ns_pkg):
     # the name.
     return pkgutil.iter_modules(ns_pkg.__path__, ns_pkg.__name__ + ".")
 
+
 def exeption_hdlr(context):
     print('ERROR ' + context.message)
+
 
 class App:
     def __init__(self) -> None:
         self.root = BaseNode()
         self.tpe = ThreadPoolExecutor()
-        self.runner = asyncio.Runner(loop_factory=self.loop_factory)
+        self.loop_factory()
+        # self.runner = asyncio.Runner()
         self.plugins = {
             name: importlib.import_module(name)
             for finder, name, ispkg
             in iter_namespace(CwmpClient.plugins)
         }
 
-    async def exec_modules(self, method :str, *args, **kwargs) -> None:
-        coros = [ getattr(self.plugins[mod], method)(*args, **kwargs) for mod in self.plugins if hasattr(self.plugins[mod], method) ]
+    async def exec_modules(self, method: str, *args, **kwargs) -> None:
+        coros = [getattr(self.plugins[mod], method)(*args, **kwargs)
+                 for mod in self.plugins if hasattr(self.plugins[mod], method)]
         await asyncio.gather(*coros)
 
     def loop_factory(self):
@@ -41,6 +46,6 @@ class App:
         return loop
 
     def run(self):
-        self.runner.run(self.exec_modules('loader', self.root))
+        asyncio.run(self.exec_modules('loader', self.root))
         prettyprint(self.root)
-        self.runner.run(self.exec_modules('start', self))
+        asyncio.run(self.exec_modules('start', self))
