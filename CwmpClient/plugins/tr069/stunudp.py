@@ -80,10 +80,11 @@ class StunMessage:
         ATTR_DONT_FRAGMENT = b'\x00\x1A'
         ATTR_RESERVATION_TOKEN = b'\x00\x22'
 
-    def __init__(self, type: MSG_TYPE) -> None:
+    def __init__(self, type: MSG_TYPE, clientHandler: 'STUN_client' = None) -> None:
         self.type = type
-        self.tranid = random.randbytes(24)
+        self.tranid = random.randbytes(12)
         self.attrs: typing.Dict[self.MSG_ATTR, bytes] = dict()
+        self.client = clientHandler
 
     def set(self, attr: MSG_ATTR, *value: any):
         if attr == self.MSG_ATTR.ATTR_DONT_FRAGMENT:
@@ -93,23 +94,30 @@ class StunMessage:
 
     def data(self) -> bytes:
         data = bytearray()
-        data.extend(b'\x00\x00')
-        data.extend(self.MAGIC_COOKIE)
-        data.extend(self.tranid)
         msg_len = 0
         for attr_type, attr_content in self.attrs.items():
             data.extend(attr_type.value)
             data.extend(struct.pack('h', len(attr_content)))
             data.extend(attr_content)
-            msg_len += len(attr_content)
+            log.debug('Attr Type: %s, %d, %s', attr_type.value.hex(), len(
+                attr_content), attr_content.hex())
+            msg_len += len(attr_content) + 4
 
-        return b''.join([self.type.value, struct.pack('h', msg_len), self.MAGIC_COOKIE, self.tranid, data])
+        log.debug('Len: %s, Dat: %s', msg_len,
+                  struct.pack('>h', msg_len).hex())
+
+        return b''.join([self.type.value, struct.pack('>h', msg_len), self.MAGIC_COOKIE, self.tranid, data])
 
     def __repr__(self) -> str:
         return ''.join(['StunMessage[', self.data().hex(), ']'])
 
-    async def sendto(self, transport: asyncio.DatagramTransport, addr=None):
-        transport.sendto(self.data(), addr)
+    async def sendto(self, stunClient: 'STUN_client' = None, addr=None):
+        if stunClient is None:
+            if self.client is None:
+                raise AssertionError("Client not defined")
+            stunClient = self.client
+        stunClient.transport.sendto(
+            self.data(), addr if addr is not None else stunClient.sturn_addr)
 
 
 def b2a_hexstr(abytes):
@@ -126,6 +134,7 @@ class StunClientProtocol(asyncio.DatagramProtocol):
     def __init__(self, client: 'STUN_client') -> None:
         super().__init__()
         self.client = client
+        self.handler: typing.List[callable[bytes]] = []
 
     def datagram_received(self, data, addr):
         log.info("Receiving UDP %s:%d = %s",
@@ -287,7 +296,7 @@ class STUN_client:
         # Require TURN protocol
         await self._start_turn()
         self.keepalive = asyncio.create_task(self._keepalive())
-        await self.keepalive
+        await asyncio.sleep(100)
 
     async def unload(self):
         if self.keepalive != None:
