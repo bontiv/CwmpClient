@@ -9,18 +9,32 @@ import hmac
 import typing
 import enum
 from CwmpClient.app import App
+from CwmpClient.plugins.tr069.session import Tr69Inform
 
 log = logging.getLogger()
+
+MAGIC_COOKIE = b'\x21\x12\xa4\x42'
+
+
+def xor_encrypt(var, key):
+    return bytes(a ^ b for a, b in zip(var, key))
 
 
 class STUN_MSG_TYPE(enum.Enum):
     REQ_BIND = b'\x00\x01'
     REQ_ALLOCATE = b'\x00\x03'
+    REQ_SEND = b'\x00\x07'
+    REQ_DATA = b'\x00\x07'
+    REQ_CREATE_PERMISSION = b'\x00\x08'
+    REQ_CHANNEL_BIND = b'\x00\x09'
 
 
 class STUN_RES_TYPE(enum.Enum):
-    RES_ALLOCATE_ERROR = b'\x01\x13'
+    RES_BIND = b'\x01\x01'
     RES_ALLOCATE_SUCESS = b'\x01\x03'
+    RES_CREATE_PERMISSION = b'\x01\x08'
+    RES_ALLOCATE_ERROR = b'\x01\x13'
+    RES_SEND_INDICATION = b'\x00\x17'  # For reading incomming packet
 
 
 class STUN_MSG_ATTR(enum.Enum):
@@ -56,61 +70,34 @@ class NAT_TYPE(enum.Enum):
     NAT_SYMETRIC = enum.auto()
 
 
-class STUN_CODE:
-    # Request type send to STUN
-
-    REQ_CHANGE = b'\x00\x03'
-    REQ_BIND = b'\x00\x01'
-    REQ_REFRESH = b'\x00\x04'
-    REQ_SEND = b'\x00\x06'
-    REQ_DATA = b'\x00\x07'
-    REQ_CREATE_PERMISSION = b'\x00\x08'
-    REQ_CHANNEL_BIND = b'\x00\x09'
-
-    # Response from STUN
-    RES_BIND = b'\x01\x01'
-    RES_FORBIDDEN = 403
-    RES_ALLOCATION_MISMATCH = 437
-    RES_WRONG_CREDENTIALS = 441
-    RES_UNSUPPORTED_PROTOCOL = 442
-    RES_ALLOCATION_QUOTA_REACHED = 486
-    RES_INSUFISANT_APACITY = 508
-
-    # Message attributes
-    ATTR_MAPPED_ADDR = b'\x00\01'
-    ATTR_SOURCE_ADDR = b'\x00\x04'
-    ATTR_CHANGE_ADDR = b'\x00\x05'
-    ATTR_CHANNEL_NUMBER = b'\x00\x0C'
-    ATTR_LIFETIME = b'\x00\x0C'
-    ATTR_XOR_PEER_ADDR = b'\x00\x12'
-    ATTR_DATA = b'\x00\x13'
-    ATTR_XOR_RELAYED_ADDR = b'\x00\x16'
-    ATTR_EVEN_PORT = b'\x00\x18'
-    ATTR_REQ_TRANSPORT = b'\x00\x19'
-    ATTR_DONT_FRAGMENT = b'\x00\x1A'
-    ATTR_RESERVATION_TOKEN = b'\x00\x22'
-
-
 class StunResponse:
     def __init__(self, transid) -> None:
         self.transid = transid
-        self.attr: typing.Dict[STUN_MSG_ATTR, any] = dict()
+        self.attrs: typing.Dict[STUN_MSG_ATTR, any] = dict()
+        self.type: STUN_RES_TYPE = None
 
     def set(self, attr: STUN_MSG_ATTR, value: bytes):
-        self.attr[attr] = value
+        self.attrs[attr] = value
 
     def getXorAddress(self, attr: STUN_MSG_ATTR):
-        data = self.attr[attr]
+        data = self.attrs[attr]
         family, = struct.unpack_from('c', data, 1)
-        port, = struct.unpack_from('>h', data ^ self.transid[0:2], 2)
-        ip = data[4:8] ^ self.transid[0:4]
+        port, = struct.unpack('>H', xor_encrypt(data[2:4], MAGIC_COOKIE))
+        ip = xor_encrypt(data[4:8], MAGIC_COOKIE)
+        ip = '.'.join([str(int(c)) for c in ip])
 
-        log.debug('Family: %d, X-Port: %d, X-Addr: %s', family,
-                  port, ip.hex())
+        log.debug('Family: %s, X-Port: %s, X-Addr: %s', family,
+                  port, ip)
+        return ip, port
+
+    def __repr__(self) -> str:
+        repr = "StunResponse<{}>[TransId:{},{}]".format(
+            self.type, self.transid, ','.join([key.name + '=' + item.hex() for key, item in self.attr.items()]))
+        return repr
 
     @staticmethod
     def frombytes(data) -> 'StunResponse':
-        if data[4:8] != b'\x21\x12\xa4\x42':
+        if data[4:8] != MAGIC_COOKIE:
             raise Exception('Bad magic cookie %s', data[4:8].hex())
 
         transid = data[8:20]
@@ -119,17 +106,19 @@ class StunResponse:
         if data[0:2] == STUN_RES_TYPE.RES_ALLOCATE_ERROR.value:
             res = StunAllocationError(transid)
             is_error = True
-        elif data[0:2] == STUN_RES_TYPE.RES_ALLOCATE_SUCESS.value:
-            res = StunResponse(transid)
         else:
-            raise NotImplementedError(
-                'Response type %s not implemanted', data[0:2].hex())
+            try:
+                res = StunResponse(transid)
+                res.type = STUN_RES_TYPE(data[0:2])
+            except ValueError:
+                raise NotImplementedError(
+                    'Response type %s not implemanted', data[0:2].hex())
 
         msg_len, = struct.unpack_from('>h', data, 2)
-        print(msg_len)
+
         pos_reader = 20
         while pos_reader < msg_len:
-            attr_len, = struct.unpack_from('>h', data, pos_reader+2)
+            attr_len, = struct.unpack_from('>H', data, pos_reader+2)
             try:
                 attr = STUN_MSG_ATTR(data[pos_reader:pos_reader+2])
                 log.debug('Attr %s (len %d) = %s', attr, attr_len,
@@ -150,8 +139,6 @@ class StunAllocationError(StunResponse, Exception):
 
 
 class StunMessage:
-    MAGIC_COOKIE = b'\x21\x12\xa4\x42'
-
     def __init__(self, type: STUN_MSG_TYPE, clientHandler: 'STUN_client' = None) -> None:
         self.type = type
         self.tranid = random.randbytes(12)
@@ -162,6 +149,26 @@ class StunMessage:
         newobj = StunMessage(self.type, self.client)
         newobj.attrs = self.attrs.copy()
         return newobj
+
+    def setXorAddress(self, attr: STUN_MSG_ATTR, addr):
+        data = bytearray(b'\x00\x01')
+        data.extend(xor_encrypt(struct.pack('>H', addr[1]), MAGIC_COOKIE))
+        data.extend(xor_encrypt(b''.join([struct.pack('B', int(x))
+                    for x in addr[0].split('.')]), MAGIC_COOKIE))
+
+        self.attrs[attr] = bytes(data)
+
+    def auth(self, client: 'STUN_client' = None) -> None:
+        if client is None:
+            client = self.client
+            if client is None:
+                raise ValueError('STUN client must be defined')
+
+        self.set(STUN_MSG_ATTR.ATTR_USERNAME,
+                 client.user)
+        self.set(STUN_MSG_ATTR.ATTR_NONCE, client.nonce)
+        self.set(STUN_MSG_ATTR.ATTR_REALM, client.realm)
+        self.set(STUN_MSG_ATTR.ATTR_MSG_INTEGRITY)
 
     def set(self, attr: STUN_MSG_ATTR, *value: any):
         if attr == STUN_MSG_ATTR.ATTR_DONT_FRAGMENT:
@@ -186,13 +193,13 @@ class StunMessage:
 
     def data(self) -> bytes:
         data = bytearray(b''.join([self.type.value, b'\x00\x00',
-                         self.MAGIC_COOKIE, self.tranid]))
+                         MAGIC_COOKIE, self.tranid]))
         msg_len = 0
 
         for attr_type, attr_content in self.attrs.items():
             log.debug('Pack %s = %s', attr_type, attr_content)
             data.extend(attr_type.value)
-            data.extend(struct.pack('>h', len(attr_content)))
+            data.extend(struct.pack('>H', len(attr_content)))
             data.extend(attr_content)
             trailling = len(attr_content) % 4
             if trailling != 0:
@@ -200,7 +207,7 @@ class StunMessage:
                     data.extend(b'\x00')
 
             if attr_type == STUN_MSG_ATTR.ATTR_MSG_INTEGRITY:
-                struct.pack_into('>h', data, 2, len(data) - 20)
+                struct.pack_into('>H', data, 2, len(data) - 20)
                 key = b''.join([str.encode(self.client.user), b':',
                                 self.attrs[STUN_MSG_ATTR.ATTR_REALM], b':', str.encode(self.client.password)])
                 md5_key = hashlib.md5(key)
@@ -212,10 +219,10 @@ class StunMessage:
                 attr_content), attr_content.hex())
             msg_len += len(attr_content) + 4
 
-        struct.pack_into('>h', data, 2, len(data) - 20)
+        struct.pack_into('>H', data, 2, len(data) - 20)
 
         log.debug('Len: %s, Dat: %s', msg_len,
-                  struct.pack('>h', msg_len).hex())
+                  struct.pack('>H', msg_len).hex())
 
         return data
 
@@ -242,20 +249,17 @@ class StunMessage:
 
             raise ConnectionRefusedError()
         except StunAllocationError as err:
-            if err.attr[STUN_MSG_ATTR.ATTR_ERROR_CODE][2:4] == b'\x04\x01' and STUN_MSG_ATTR.ATTR_MSG_INTEGRITY not in self.attrs:
+            if err.attrs[STUN_MSG_ATTR.ATTR_ERROR_CODE][2:4] == b'\x04\x01' and STUN_MSG_ATTR.ATTR_MSG_INTEGRITY not in self.attrs:
                 log.debug('Authentication needed')
                 auth_msg = self.copy()
-                auth_msg.set(STUN_MSG_ATTR.ATTR_USERNAME, stunClient.user)
-                auth_msg.set(STUN_MSG_ATTR.ATTR_REALM,
-                             err.attr[STUN_MSG_ATTR.ATTR_REALM])
-                auth_msg.set(STUN_MSG_ATTR.ATTR_NONCE,
-                             err.attr[STUN_MSG_ATTR.ATTR_NONCE])
-                auth_msg.set(STUN_MSG_ATTR.ATTR_MSG_INTEGRITY)
+                stunClient.realm = err.attrs[STUN_MSG_ATTR.ATTR_REALM]
+                stunClient.nonce = err.attrs[STUN_MSG_ATTR.ATTR_NONCE]
+                auth_msg.auth(stunClient)
                 return await auth_msg.sendto(stunClient, addr)
 
             else:
                 log.error('Unknown error code: %s',
-                          err.attr[STUN_MSG_ATTR.ATTR_ERROR_CODE][2:4].hex())
+                          err.attrs[STUN_MSG_ATTR.ATTR_ERROR_CODE][2:4].hex())
                 raise err
         finally:
             del stunClient.results[self.tranid]
@@ -275,73 +279,20 @@ class StunClientProtocol(asyncio.DatagramProtocol):
     def __init__(self, client: 'STUN_client') -> None:
         super().__init__()
         self.client = client
+        self.last_trans: typing.List[bytes] = []
 
     def datagram_received(self, data, addr):
         log.info("Receiving UDP %s:%d = %s",
                  addr[0], addr[1], b2a_hexstr(data))
-
         try:
             res = StunResponse.frombytes(data)
-            self.client.results[res.transid].set_result(res)
+            if res.type == STUN_RES_TYPE.RES_SEND_INDICATION:
+                self.client.process(res.attrs[STUN_MSG_ATTR.ATTR_DATA])
+            elif res.transid in self.client.results:
+                self.client.results[res.transid].set_result(res)
         except StunAllocationError as err:
-            self.client.results[err.transid].set_exception(err)
-        return
-
-        log.debug('Infos from %s', addr)
-        result: StunResponse = {'source_addr': (
-            None, None), 'remote_addr': (None, None), 'change_addr': (None, None)}
-        msgtype = data[0:2]
-        if msgtype == STUN_CODE.RES_BIND:  # Response type
-            log.debug('Get STUN packet')
-            if self.client.tranid.upper() != b2a_hexstr(data[4:20]).upper():
-                log.error('Cookie not valid. This packet cannot be executed')
-                return
-
-            len_message = int(b2a_hexstr(data[2:4]), 16)
-            len_remain = len_message
-            ptr = 20
-            while len_remain:
-                attr_type = data[ptr:(ptr + 2)]
-                attr_len = int(b2a_hexstr(data[(ptr + 2):(ptr + 4)]), 16)
-                if attr_type == STUN_CODE.ATTR_MAPPED_ADDR:
-                    # Mapped address
-                    port = int(b2a_hexstr(data[ptr + 6:ptr + 8]), 16)
-                    ip = ".".join([
-                        str(int(b2a_hexstr(data[ptr + 8:ptr + 9]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 9:ptr + 10]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 10:ptr + 11]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 11:ptr + 12]), 16))
-                    ])
-                    log.debug("Get mapped address: %s, %d", ip, port)
-                    result['remote_addr'] = (ip, port)
-
-                elif attr_type == STUN_CODE.ATTR_SOURCE_ADDR:
-                    # source address
-                    port = int(b2a_hexstr(data[ptr + 6:ptr + 8]), 16)
-                    ip = ".".join([
-                        str(int(b2a_hexstr(data[ptr + 8:ptr + 9]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 9:ptr + 10]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 10:ptr + 11]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 11:ptr + 12]), 16))
-                    ])
-                    log.debug("Get source address: %s, %d", ip, port)
-                    result['source_addr'] = (ip, port)
-
-                elif attr_type == STUN_CODE.ATTR_CHANGE_ADDR:
-                    # Changed address
-                    port = int(b2a_hexstr(data[ptr + 6:ptr + 8]), 16)
-                    ip = ".".join([
-                        str(int(b2a_hexstr(data[ptr + 8:ptr + 9]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 9:ptr + 10]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 10:ptr + 11]), 16)),
-                        str(int(b2a_hexstr(data[ptr + 11:ptr + 12]), 16))
-                    ])
-                    log.debug("Get changed address: %s, %d", ip, port)
-                    result['change_addr'] = (ip, port)
-
-                ptr = ptr + 4 + attr_len
-                len_remain = len_remain - (4 + attr_len)
-        self.client._last_response.set_result(result)
+            if err.transid in self.client.results:
+                self.client.results[err.transid].set_exception(err)
 
 
 class STUN_client:
@@ -355,65 +306,24 @@ class STUN_client:
         self.results: typing.Dict[bytes, StunResponse] = dict()
         self.user: str = None
         self.password: str = None
-
-    async def _send_stun_request(self, remote_addr: typing.Tuple[str, int] = None, send_data=b'', req_type=STUN_CODE.REQ_BIND):
-        if remote_addr is None:
-            remote_addr = self.sturn_addr
-        self.tranid = '2112a442' + ''.join(random.choice('0123456789ABCDEF')
-                                           for i in range(24))
-        str_len = "%#04d" % len(send_data)
-        str_data = ''.join(
-            [str_len, self.tranid])
-        data = req_type + binascii.a2b_hex(str_data) + send_data
-        self._last_response: asyncio.Future[StunResponse] = asyncio.Future()
-        log.debug('Send to: %s, Data: %s', remote_addr, data)
-
-        for i in range(5):
-            self.transport.sendto(data, remote_addr)
-            await asyncio.wait([self._last_response], timeout=1)
-            if self._last_response.done():
-                return self._last_response.result()
-            log.debug('Retry %d', i)
-
-        return None
-
-    async def _get_public_addr(self, remote_addr: typing.Tuple[str, int] = None) -> typing.Tuple[NAT_TYPE, typing.Tuple[str, int]]:
-        if remote_addr is None:
-            remote_addr = self.sturn_addr
-        log.debug('First try: Find changed IP and external IP')
-        first_try = await self._send_stun_request(remote_addr=remote_addr)
-        log.debug('First try: %s', first_try)
-        local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
-
-        if first_try is None:
-            raise Exception("Cannot receive UDP. All ports may be blocked.")
-        elif first_try['remote_addr'][0] in local_ips:
-            log.info("Not natted device.")
-            return NAT_TYPE.NAT_NONE, first_try['remote_addr']
-
-        data_request_changed = STUN_CODE.REQ_CHANGE + b'\x00\x04' + b'\x00\x00\x00\x06'
-
-        log.debug('second_try: Try getting packet from another IP/port')
-        second_try = await self._send_stun_request(remote_addr, data_request_changed)
-        log.debug('second_try: %s', second_try)
-        if second_try is not None:
-            return [NAT_TYPE.NAT_FULL, first_try['remote_addr']]
-
-        log.debug('third_try: Send packet to changed address')
-        third_try = await self._send_stun_request(first_try['change_addr'])
-        log.debug('third_try: %s', third_try)
-        if third_try is False:
-            raise Exception("Cannot determine NAT type")
-
-        if third_try['remote_addr'][0] == first_try['remote_addr'][0] and third_try['remote_addr'][1] == first_try['remote_addr'][1]:
-            log.info("Restricted type NAT")
-            return NAT_TYPE.NAT_RESTRICTED, first_try['remote_addr']
-        return NAT_TYPE.NAT_SYMETRIC, second_try['remote_addr']
+        self.nonce: bytes = None
+        self.realm: bytes = None
+        self.tasks: typing.List[asyncio.Task] = []
 
     async def _keepalive(self):
         while True:
             await asyncio.sleep(600)  # Default timeout 10 mins for Keepalive
-            await self._get_public_addr()
+
+    def process(self, data: bytes) -> None:
+        text = data.decode()
+        print('Data received ! : ' + text)
+
+        # On data received, launch session
+        req = Tr69Inform(self.app, '6 CONNECTION REQUEST')
+        self.tasks.append(asyncio.create_task(req.run()))
+        for task in self.tasks:
+            if task.done():
+                del self.tasks[task]
 
     async def _start_turn(self):
         allocation = StunMessage(STUN_MSG_TYPE.REQ_ALLOCATE, self)
@@ -425,6 +335,17 @@ class STUN_client:
         allocation.set(STUN_MSG_ATTR.ATTR_DONT_FRAGMENT)
         print(allocation)
         return await allocation.sendto(self)
+
+    async def _detect_nat(self):
+        bind_test = StunMessage(STUN_MSG_TYPE.REQ_BIND, self)
+        result_bind = await bind_test.sendto()
+        log.debug(result_bind.getXorAddress(
+            STUN_MSG_ATTR.ATTR_XOR_MAPPED_ADDR))
+
+        local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+
+        return result_bind.getXorAddress(
+            STUN_MSG_ATTR.ATTR_XOR_MAPPED_ADDR) not in local_ips
 
     async def load(self):
         loop = asyncio.get_event_loop()
@@ -440,25 +361,36 @@ class STUN_client:
         print(sturn_addr_info)
         self.sturn_addr = sturn_addr_info[0][4]
 
-        self.transport, self.protocol = await loop.create_datagram_endpoint(lambda: StunClientProtocol(self), local_addr=('0.0.0.0', 10340), family=socket.AF_INET)
+        self.transport, self.protocol = await loop.create_datagram_endpoint(lambda: StunClientProtocol(self), local_addr=('0.0.0.0', random.randint(49152, 65535)), family=socket.AF_INET)
         log.info("Start STUN discovery at: %s:%d", server, port)
 
-        # nat_type, public_address = await self._get_public_addr()
-        # self.app.root['Device']['ManagementServer']['NATDetected'](
-        #     nat_type != NAT_TYPE.NAT_NONE)
-        # self.app.root['Device']['ManagementServer']['UDPConnectionRequestAddress'](
-        #     public_address[0] + ":" + str(public_address[1]))
+        is_nated = await self._detect_nat()
+        self.app.root['Device']['ManagementServer']['NATDetected'](is_nated)
 
-        # print(nat_type)
+        if is_nated:
+            public_nat = await self._start_turn()
+            public_address = public_nat.getXorAddress(
+                STUN_MSG_ATTR.ATTR_XOR_RELAYED_ADDR)
 
-        # Require TURN protocol
-        mapped = await self._start_turn()
-        log.info('Public IP: %s, Relai IP: %s', mapped.getXorAddress(
-            STUN_MSG_ATTR.ATTR_XOR_MAPPED_ADDR), mapped.getXorAddress(STUN_MSG_ATTR.ATTR_XOR_RELAYED_ADDR))
-        self.keepalive = asyncio.create_task(self._keepalive())
-        await asyncio.sleep(100)
+            log.info('Use public interface %s:%d',
+                     public_address[0], public_address[1])
+
+            self.app.root['Device']['ManagementServer']['UDPConnectionRequestAddress'](
+                public_address[0] + ":" + str(public_address[1]))
+
+            # Create permission
+            perms = StunMessage(STUN_MSG_TYPE.REQ_CREATE_PERMISSION, self)
+            perms.setXorAddress(
+                STUN_MSG_ATTR.ATTR_XOR_PEER_ADDR, self.sturn_addr)
+            perms.set(STUN_MSG_ATTR.ATTR_USERNAME, self.user)
+            perms.auth(self)
+            perms_resp = await perms.sendto()
+            log.debug(perms_resp)
 
     async def unload(self):
         if self.keepalive != None:
             self.keepalive.cancel()
             await self.keepalive
+
+        if self.task is not None:
+            await self.task
